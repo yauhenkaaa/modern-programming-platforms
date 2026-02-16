@@ -1,0 +1,15 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\myTestedProject\myTestedProject.csproj" />
+    <ProjectReference Include="..\myTestingLibrary\myTestingLibrary.csproj" />
+    <ProjectReference Include="..\myTestRunner\myTestRunner.csproj" />
+  </ItemGroup>
+
+</Project>
