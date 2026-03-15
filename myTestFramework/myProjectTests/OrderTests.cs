@@ -22,9 +22,11 @@ namespace myProjectTests
         /// <summary>
         /// This method tests the CheckStockAsync method of the InventoryService class using the shared context instance.
         /// </summary>
+        [TestClass(timeout: 1)]
         [TestMethod]
         public async Task TestStockCheckAsync()
         {
+            await Task.Delay(200000);
             bool result = await _inventory.CheckStockAsync(1);
             Assertion.IsTrue(result);
         }
@@ -32,6 +34,7 @@ namespace myProjectTests
         /// <summary>
         /// This method tests the CreateOrderAsync method of the OrderManager class using the shared _inventory.
         /// </summary>
+        [TestClass(timeout: 2000)]
         [TestMethod]
         public async Task TestOrderResultType()
         {

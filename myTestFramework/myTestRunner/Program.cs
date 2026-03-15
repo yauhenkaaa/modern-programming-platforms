@@ -2,6 +2,7 @@ using myTestedProject;
 using myTestingLibrary;
 using myTestingLibrary.Attributes;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -18,6 +19,9 @@ namespace myTestRunner
         /// <summary>Directory of the loaded test assembly; used to resolve dependencies (e.g. myTestedProject).</summary>
         private static string? s_testAssemblyDirectory;
 
+        /// <summary>Lock object for synchronized console output from parallel tests.</summary>
+        private static readonly object s_consoleLock = new object();
+
         private sealed class TestResult
         {
             public string FullName { get; set; } = "";
@@ -25,19 +29,51 @@ namespace myTestRunner
             public string? ErrorMessage { get; set; }
         }
 
+        private sealed class TestWorkItem
+        {
+            public Type TestClassType { get; init; } = null!;
+            public MethodInfo Method { get; init; } = null!;
+            public string FullName { get; init; } = "";
+            public int TimeoutMilliseconds { get; init; }
+        }
+
         static void Main(string[] args)
         {
-            if (args.Length == 0)
+            // Always use myProjectTests.dll artifact as the test assembly.
+            // Assume runner is executed from myTestFramework/myTestRunner/bin/<Configuration>/net8.0
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            // baseDir: .../myTestFramework/myTestRunner/bin/<Configuration>/net8.0/
+
+            // В задании ваш тестовый проект собирается в Debug/net8.0,
+            // поэтому жёстко используем конфигурацию Debug.
+            string configuration = "Debug";
+
+            // Find solution root folder "myTestFramework" by walking up the directory tree
+            DirectoryInfo? dir = new DirectoryInfo(baseDir);
+            while (dir != null && !dir.Name.Equals("myTestFramework", StringComparison.OrdinalIgnoreCase))
             {
-                Console.WriteLine("Usage: myTestRunner <path-to-test-assembly.dll>");
+                dir = dir.Parent;
+            }
+
+            if (dir == null)
+            {
+                Console.WriteLine("Error: Unable to locate 'myTestFramework' directory from: " + baseDir);
                 return;
             }
 
-            string filePath = args[0];
-            var fileInfo = new FileInfo(filePath);
+            // dir is .../myTestFramework
+            string testDllPath = Path.Combine(
+                dir.FullName,
+                "myProjectTests",
+                "bin",
+                configuration,
+                "net8.0",
+                "myProjectTests.dll");
+
+            var fileInfo = new FileInfo(testDllPath);
             if (!fileInfo.Exists)
             {
-                Console.WriteLine("Error: Test file not found: " + filePath);
+                Console.WriteLine("Error: Test file not found: " + testDllPath);
                 return;
             }
 
@@ -47,6 +83,15 @@ namespace myTestRunner
 
             Console.WriteLine("Test file found: " + fullPath);
             Console.WriteLine();
+
+            // Configure MaxDegreeOfParallelism:
+            //  - first argument (if present) tries to override it
+            //  - otherwise use number of logical processors
+            int maxDegreeOfParallelism = Environment.ProcessorCount;
+            if (args.Length > 0 && int.TryParse(args[0], out int parsed) && parsed > 0)
+            {
+                maxDegreeOfParallelism = parsed;
+            }
 
             var testStructure = DiscoverTests(fullPath);
             if (testStructure.Count == 0)
@@ -59,8 +104,12 @@ namespace myTestRunner
             var sharedInventory = new InventoryService();
             TestContextContainer.RegisterSharedObject(sharedInventory);
 
-            var results = RunAllTests(testStructure);
+            DateTime startTime = DateTime.Now;
+            var results = RunAllTests(testStructure, maxDegreeOfParallelism);
+            DateTime endTime = DateTime.Now;
+
             PrintSummary(results);
+            WriteTestProtocol(results, startTime, endTime);
         }
 
         /// <summary>
@@ -101,53 +150,80 @@ namespace myTestRunner
             return testStructure;
         }
 
-        private static List<TestResult> RunAllTests(Dictionary<Type, List<MethodInfo>> testStructure)
+        private static List<TestResult> RunAllTests(Dictionary<Type, List<MethodInfo>> testStructure, int maxDegreeOfParallelism)
         {
-            var results = new List<TestResult>();
+            var workItems = new List<TestWorkItem>();
 
             foreach (var kv in testStructure.OrderBy(k => k.Key.Name))
             {
                 Type testClassType = kv.Key;
                 List<MethodInfo> methods = kv.Value;
 
-                object? instance = null;
-                try
+                int classTimeout = 0;
+                var classAttr = testClassType.GetCustomAttribute<TestClassAttribute>();
+                if (classAttr != null && classAttr.Timeout > 0)
                 {
-                    instance = Activator.CreateInstance(testClassType);
+                    classTimeout = classAttr.Timeout;
                 }
-                catch (Exception ex)
-                {
-                    foreach (var method in methods)
-                    {
-                        string fullName = $"{testClassType.FullName}.{method.Name}";
-                        Console.ForegroundColor = ConsoleColor.Yellow;
-                        Console.WriteLine($"Loading test: {fullName}");
-                        Console.ResetColor();
-
-                        var failResult = new TestResult { FullName = fullName, Passed = false, ErrorMessage = "Failed to create test class instance: " + ex.Message };
-                        results.Add(failResult);
-                        PrintTestResult(failResult);
-                    }
-                    continue;
-                }
-
-                InjectSharedContext(instance, testClassType);
 
                 foreach (MethodInfo method in methods)
                 {
                     string fullName = $"{testClassType.FullName}.{method.Name}";
 
-                    Console.ForegroundColor = ConsoleColor.Yellow;
-                    Console.WriteLine($"Loading test: {fullName}");
-                    Console.ResetColor();
+                    int timeout = classTimeout;
+                    var methodTimeoutAttr = method.GetCustomAttribute<TestClassAttribute>();
+                    if (methodTimeoutAttr != null && methodTimeoutAttr.Timeout > 0)
+                    {
+                        timeout = methodTimeoutAttr.Timeout;
+                    }
 
-                    var result = RunSingleTest(instance, testClassType, method, fullName);
-                    results.Add(result);
-                    PrintTestResult(result);
+                    workItems.Add(new TestWorkItem
+                    {
+                        TestClassType = testClassType,
+                        Method = method,
+                        FullName = fullName,
+                        TimeoutMilliseconds = timeout
+                    });
                 }
             }
 
-            return results;
+            var resultsBag = new ConcurrentBag<TestResult>();
+
+            Parallel.ForEach(
+                workItems,
+                new ParallelOptions { MaxDegreeOfParallelism = maxDegreeOfParallelism },
+                workItem =>
+                {
+                    object? instance = null;
+                    try
+                    {
+                        instance = Activator.CreateInstance(workItem.TestClassType);
+                    }
+                    catch (Exception ex)
+                    {
+                        var failResult = new TestResult
+                        {
+                            FullName = workItem.FullName,
+                            Passed = false,
+                            ErrorMessage = "Failed to create test class instance: " + ex.Message
+                        };
+                        resultsBag.Add(failResult);
+                        return;
+                    }
+
+                    InjectSharedContext(instance!, workItem.TestClassType);
+
+                    var result = RunSingleTestWithTimeout(instance!, workItem.TestClassType, workItem.Method, workItem.FullName, workItem.TimeoutMilliseconds);
+                    resultsBag.Add(result);
+                });
+            
+            var orderedResults = resultsBag.OrderBy(r => r.FullName).ToList();
+            foreach (var result in orderedResults)
+            {
+                PrintTestResult(result);
+            }
+
+            return orderedResults;
         }
 
         /// <summary>
@@ -228,30 +304,69 @@ namespace myTestRunner
             }
         }
 
+        /// <summary>
+        /// Wraps RunSingleTest with optional timeout, using TestClassAttribute.Timeout
+        /// from the test class or method. If timeoutMs &lt;= 0, test runs without timeout.
+        /// </summary>
+        private static TestResult RunSingleTestWithTimeout(object instance, Type testClassType, MethodInfo method, string fullName, int timeoutMs)
+        {
+            if (timeoutMs <= 0)
+            {
+                return RunSingleTest(instance, testClassType, method, fullName);
+            }
+
+            try
+            {
+                var task = Task.Run(() => RunSingleTest(instance, testClassType, method, fullName));
+                bool completedInTime = task.Wait(timeoutMs);
+                if (!completedInTime)
+                {
+                    return new TestResult
+                    {
+                        FullName = fullName,
+                        Passed = false,
+                        ErrorMessage = $"Test timed out after {timeoutMs} ms."
+                    };
+                }
+
+                return task.Result;
+            }
+            catch (AggregateException ex)
+            {
+                string message = ex.InnerException?.Message ?? ex.Message;
+                if (ex.InnerException?.StackTrace != null)
+                    message += Environment.NewLine + ex.InnerException.StackTrace;
+                return new TestResult { FullName = fullName, Passed = false, ErrorMessage = message };
+            }
+        }
+
         private static void PrintTestResult(TestResult result)
         {
-            if (result.Passed)
+            lock (s_consoleLock)
             {
-                Console.BackgroundColor = ConsoleColor.Green;
-                Console.ForegroundColor = ConsoleColor.Black;
-                Console.Write(" SUCCESS ");
-                Console.ResetColor();
-                Console.WriteLine("");
-            }
-            else
-            {
-                Console.BackgroundColor = ConsoleColor.Red;
-                Console.ForegroundColor = ConsoleColor.White;
-                Console.Write(" FAILURE ");
-                Console.ResetColor();
-                Console.WriteLine("");
-                if (!string.IsNullOrEmpty(result.ErrorMessage))
+                if (result.Passed)
                 {
-                    Console.WriteLine(result.ErrorMessage);
+                    Console.BackgroundColor = ConsoleColor.Green;
+                    Console.ForegroundColor = ConsoleColor.Black;
+                    Console.Write(" SUCCESS ");
                     Console.ResetColor();
+                    Console.WriteLine($" {result.FullName}");
                 }
+                else
+                {
+                    Console.BackgroundColor = ConsoleColor.Red;
+                    Console.ForegroundColor = ConsoleColor.White;
+                    Console.Write(" FAILURE ");
+                    Console.ResetColor();
+                    Console.WriteLine($" {result.FullName}");
+                    if (!string.IsNullOrEmpty(result.ErrorMessage))
+                    {
+                        Console.WriteLine(result.ErrorMessage);
+                        Console.ResetColor();
+                    }
+                }
+                Console.WriteLine();
             }
-            Console.WriteLine();
         }
 
         private static void PrintSummary(List<TestResult> results)
@@ -260,10 +375,13 @@ namespace myTestRunner
             int passed = results.Count(r => r.Passed);
             int failed = total - passed;
 
+            double successPercent = total == 0 ? 0.0 : (double)passed / total * 100.0;
+
             Console.WriteLine("========== Test run summary ==========");
             Console.WriteLine($"Total tests:  {total}");
             Console.WriteLine($"Passed:       {passed}");
             Console.WriteLine($"Failed:       {failed}");
+            Console.WriteLine($"Success rate: {successPercent:F2}%");
             Console.WriteLine();
             Console.WriteLine("Tests:");
             foreach (var r in results)
@@ -272,6 +390,76 @@ namespace myTestRunner
                 Console.WriteLine($"  {r.FullName}{status}");
             }
             Console.WriteLine("======================================");
+        }
+
+        /// <summary>
+        /// Writes a textual test protocol into MyTestRunner/TestResults.
+        /// Contains start time, duration, successful tests count, success percentage,
+        /// and error information for failed tests.
+        /// </summary>
+        private static void WriteTestProtocol(List<TestResult> results, DateTime startTime, DateTime endTime)
+        {
+            try
+            {
+                string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+
+                // Locate 'myTestFramework/myTestRunner' project directory to place TestResults there.
+                DirectoryInfo? dir = new DirectoryInfo(baseDir);
+                while (dir != null && !dir.Name.Equals("myTestRunner", StringComparison.OrdinalIgnoreCase))
+                {
+                    dir = dir.Parent;
+                }
+
+                if (dir == null)
+                    return;
+
+                string resultsDir = Path.Combine(dir.FullName, "TestResults");
+                Directory.CreateDirectory(resultsDir);
+
+                string fileName = $"TestResults_{DateTime.Now:yyyyMMdd_HHmmss}.txt";
+                string filePath = Path.Combine(resultsDir, fileName);
+
+                int total = results.Count;
+                int passed = results.Count(r => r.Passed);
+                int failed = total - passed;
+                double successPercent = total == 0 ? 0.0 : (double)passed / total * 100.0;
+                TimeSpan duration = endTime - startTime;
+
+                using (var writer = new StreamWriter(filePath, false))
+                {
+                    writer.WriteLine("========== Test protocol ==========");
+                    writer.WriteLine($"Start time:           {startTime:O}");
+                    writer.WriteLine($"End time:             {endTime:O}");
+                    writer.WriteLine($"Total duration:       {duration}");
+                    writer.WriteLine();
+                    writer.WriteLine($"Total tests:          {total}");
+                    writer.WriteLine($"Successful tests:     {passed}");
+                    writer.WriteLine($"Failed tests:         {failed}");
+                    writer.WriteLine($"Success percentage:   {successPercent:F2}%");
+                    writer.WriteLine();
+
+                    if (failed > 0)
+                    {
+                        writer.WriteLine("Failed tests detail:");
+                        foreach (var r in results.Where(r => !r.Passed))
+                        {
+                            writer.WriteLine("--------------------------------------");
+                            writer.WriteLine($"Test: {r.FullName}");
+                            if (!string.IsNullOrEmpty(r.ErrorMessage))
+                            {
+                                writer.WriteLine("Error:");
+                                writer.WriteLine(r.ErrorMessage);
+                            }
+                        }
+                    }
+
+                    writer.WriteLine("====================================");
+                }
+            }
+            catch
+            {
+                // Ignore any IO/permissions errors when writing protocol.
+            }
         }
     }
 }
