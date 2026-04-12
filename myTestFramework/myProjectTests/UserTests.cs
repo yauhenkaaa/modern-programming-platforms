@@ -77,5 +77,21 @@ namespace myProjectTests
             Thread.Sleep(2000);
             Assertion.IsFalse(service.IsCouponExpired("NEW_YEAR_2025"));
         }
+
+        public static IEnumerable<object[]> GetDiscountData()
+        {
+            yield return new object[] { "SAVE10", 100m, 90m };
+            yield return new object[] { "SAVE50", 100m, 50m };
+            yield return new object[] { "INVALID", 100m, 100m };
+        }
+
+        // Добавьте сам параметризованный тест
+        [TestMethod]
+        [DynamicData(nameof(GetDiscountData))]
+        public void TestApplyCouponParameterized(string code, decimal total, decimal expected)
+        {
+            DiscountService service = new DiscountService();
+            Assertion.AreEqual(expected, service.ApplyCoupon(code, total));
+        }
     }
 }

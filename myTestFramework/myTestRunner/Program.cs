@@ -1,26 +1,33 @@
 using myTestedProject;
 using myTestingLibrary;
 using myTestingLibrary.Attributes;
+using myThreadPool;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace myTestRunner
 {
     /// <summary>
-    /// Test execution loop, async handling, and result collection.
+    /// Test execution loop, async handling, result collection, and thread pool integration.
     /// </summary>
     public class Program
     {
-        /// <summary>Directory of the loaded test assembly; used to resolve dependencies (e.g. myTestedProject).</summary>
+        /// <summary>Directory of the loaded test assembly; used to resolve dependencies.</summary>
         private static string? s_testAssemblyDirectory;
 
         /// <summary>Lock object for synchronized console output from parallel tests.</summary>
         private static readonly object s_consoleLock = new object();
+
+        /// <summary>
+        /// Делегат для фильтрации тестов на этапе обнаружения.
+        /// </summary>
+        public delegate bool TestFilter(Type testClass, MethodInfo testMethod, TestMethodAttribute methodAttr);
 
         private sealed class TestResult
         {
@@ -35,20 +42,14 @@ namespace myTestRunner
             public MethodInfo Method { get; init; } = null!;
             public string FullName { get; init; } = "";
             public int TimeoutMilliseconds { get; init; }
+            public object[]? Arguments { get; init; } // Добавлено для параметризованных тестов
         }
 
         static void Main(string[] args)
         {
-            // Always use myProjectTests.dll artifact as the test assembly.
-            // Assume runner is executed from myTestFramework/myTestRunner/bin/<Configuration>/net8.0
             string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-            // baseDir: .../myTestFramework/myTestRunner/bin/<Configuration>/net8.0/
-
-            // В задании ваш тестовый проект собирается в Debug/net8.0,
-            // поэтому жёстко используем конфигурацию Debug.
             string configuration = "Debug";
 
-            // Find solution root folder "myTestFramework" by walking up the directory tree
             DirectoryInfo? dir = new DirectoryInfo(baseDir);
             while (dir != null && !dir.Name.Equals("myTestFramework", StringComparison.OrdinalIgnoreCase))
             {
@@ -61,7 +62,6 @@ namespace myTestRunner
                 return;
             }
 
-            // dir is .../myTestFramework
             string testDllPath = Path.Combine(
                 dir.FullName,
                 "myProjectTests",
@@ -84,37 +84,75 @@ namespace myTestRunner
             Console.WriteLine("Test file found: " + fullPath);
             Console.WriteLine();
 
-            // Configure MaxDegreeOfParallelism:
-            //  - first argument (if present) tries to override it
-            //  - otherwise use number of logical processors
+            // Применяем фильтрацию через делегат. 
+            // В данном примере пропускаем тесты, у которых стоит флаг Ignore = true.
+            TestFilter myFilter = (testClass, testMethod, methodAttr) => !methodAttr.Ignore;
+
+            var workItems = DiscoverAndFilterTests(fullPath, myFilter);
+            if (workItems.Count == 0)
+            {
+                Console.WriteLine("No test classes or methods found matching the filter.");
+                return;
+            }
+
+            // Register shared context
+            var sharedInventory = new InventoryService();
+            TestContextContainer.RegisterSharedObject(sharedInventory);
+
+            // Инициализация собственного пула потоков
             int maxDegreeOfParallelism = Environment.ProcessorCount;
             if (args.Length > 0 && int.TryParse(args[0], out int parsed) && parsed > 0)
             {
                 maxDegreeOfParallelism = parsed;
             }
 
-            var testStructure = DiscoverTests(fullPath);
-            if (testStructure.Count == 0)
+            var poolOptions = new DynamicThreadPoolOptions
             {
-                Console.WriteLine("No test classes or methods found in the assembly.");
-                return;
+                MinThreads = 2,
+                MaxThreads = maxDegreeOfParallelism,
+                WorkerIdleTimeoutMs = 3000
+            };
+
+            using var pool = new DynamicThreadPool(poolOptions);
+
+            // Подписка на события жизненного цикла пула потоков
+            pool.Monitoring += OnPoolMonitoring;
+            pool.Start();
+
+            Console.WriteLine($"Pool started with MaxThreads = {poolOptions.MaxThreads}. Enqueuing {workItems.Count} tests...");
+
+            var resultsBag = new ConcurrentBag<TestResult>();
+            using var countdownEvent = new CountdownEvent(workItems.Count);
+            DateTime startTime = DateTime.Now;
+
+            foreach (var workItem in workItems)
+            {
+                pool.Enqueue(() =>
+                {
+                    try
+                    {
+                        var result = ExecuteTestItem(workItem);
+                        resultsBag.Add(result);
+                        PrintTestResult(result);
+                    }
+                    finally
+                    {
+                        countdownEvent.Signal();
+                    }
+                }, workItem.FullName);
             }
 
-            // Register shared context: one InventoryService instance injected into test classes via [SharedContext].
-            var sharedInventory = new InventoryService();
-            TestContextContainer.RegisterSharedObject(sharedInventory);
-
-            DateTime startTime = DateTime.Now;
-            var results = RunAllTests(testStructure, maxDegreeOfParallelism);
+            // Ожидаем завершения всех задач в пуле
+            countdownEvent.Wait();
             DateTime endTime = DateTime.Now;
 
-            PrintSummary(results);
-            WriteTestProtocol(results, startTime, endTime);
+            pool.Shutdown(waitForWorkers: true);
+
+            var orderedResults = resultsBag.OrderBy(r => r.FullName).ToList();
+            PrintSummary(orderedResults);
+            WriteTestProtocol(orderedResults, startTime, endTime);
         }
 
-        /// <summary>
-        /// Resolves assemblies (e.g. myTestedProject, myTestingLibrary) from the same directory as the test assembly.
-        /// </summary>
         private static Assembly? ResolveAssemblyFromTestDirectory(object? sender, ResolveEventArgs args)
         {
             if (string.IsNullOrEmpty(s_testAssemblyDirectory))
@@ -128,108 +166,112 @@ namespace myTestRunner
             return Assembly.LoadFrom(path);
         }
 
-        private static Dictionary<Type, List<MethodInfo>> DiscoverTests(string assemblyPath)
+        private static List<TestWorkItem> DiscoverAndFilterTests(string assemblyPath, TestFilter filter)
         {
-            var testStructure = new Dictionary<Type, List<MethodInfo>>();
+            var workItems = new List<TestWorkItem>();
             var assembly = Assembly.LoadFrom(assemblyPath);
             Type[] types = assembly.GetTypes();
 
             foreach (Type type in types)
             {
-                if (type.GetCustomAttribute(typeof(TestClassAttribute)) == null)
+                var classAttr = type.GetCustomAttribute<TestClassAttribute>();
+                if (classAttr == null)
                     continue;
 
-                var testMethods = type.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static)
-                    .Where(m => m.GetCustomAttribute(typeof(TestMethodAttribute)) != null)
-                    .ToList();
+                int classTimeout = classAttr.Timeout > 0 ? classAttr.Timeout : 0;
 
-                if (testMethods.Count > 0)
-                    testStructure.Add(type, testMethods);
-            }
-
-            return testStructure;
-        }
-
-        private static List<TestResult> RunAllTests(Dictionary<Type, List<MethodInfo>> testStructure, int maxDegreeOfParallelism)
-        {
-            var workItems = new List<TestWorkItem>();
-
-            foreach (var kv in testStructure.OrderBy(k => k.Key.Name))
-            {
-                Type testClassType = kv.Key;
-                List<MethodInfo> methods = kv.Value;
-
-                int classTimeout = 0;
-                var classAttr = testClassType.GetCustomAttribute<TestClassAttribute>();
-                if (classAttr != null && classAttr.Timeout > 0)
-                {
-                    classTimeout = classAttr.Timeout;
-                }
-
+                var methods = type.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static);
                 foreach (MethodInfo method in methods)
                 {
-                    string fullName = $"{testClassType.FullName}.{method.Name}";
+                    var methodAttr = method.GetCustomAttribute<TestMethodAttribute>();
+                    if (methodAttr == null)
+                        continue;
 
-                    int timeout = classTimeout;
-                    var methodTimeoutAttr = method.GetCustomAttribute<TestClassAttribute>();
-                    if (methodTimeoutAttr != null && methodTimeoutAttr.Timeout > 0)
+                    // Применяем фильтр
+                    if (!filter(type, method, methodAttr))
+                        continue;
+
+                    int timeout = methodAttr.Timeout > 0 ? methodAttr.Timeout : classTimeout;
+                    string baseFullName = $"{type.FullName}.{method.Name}";
+
+                    // Проверяем наличие атрибута параметризованного теста
+                    var dynamicDataAttr = method.GetCustomAttribute<DynamicDataAttribute>();
+                    if (dynamicDataAttr != null)
                     {
-                        timeout = methodTimeoutAttr.Timeout;
+                        var dataMethod = type.GetMethod(dynamicDataAttr.MethodName, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                        if (dataMethod != null)
+                        {
+                            var testData = (IEnumerable<object[]>)dataMethod.Invoke(null, null)!;
+                            int caseIndex = 1;
+                            foreach (var args in testData)
+                            {
+                                workItems.Add(new TestWorkItem
+                                {
+                                    TestClassType = type,
+                                    Method = method,
+                                    FullName = $"{baseFullName} [Case {caseIndex++}]",
+                                    TimeoutMilliseconds = timeout,
+                                    Arguments = args
+                                });
+                            }
+                            continue;
+                        }
                     }
 
+                    // Обычный тест (без параметров)
                     workItems.Add(new TestWorkItem
                     {
-                        TestClassType = testClassType,
+                        TestClassType = type,
                         Method = method,
-                        FullName = fullName,
-                        TimeoutMilliseconds = timeout
+                        FullName = baseFullName,
+                        TimeoutMilliseconds = timeout,
+                        Arguments = null
                     });
                 }
             }
 
-            var resultsBag = new ConcurrentBag<TestResult>();
-
-            Parallel.ForEach(
-                workItems,
-                new ParallelOptions { MaxDegreeOfParallelism = maxDegreeOfParallelism },
-                workItem =>
-                {
-                    object? instance = null;
-                    try
-                    {
-                        instance = Activator.CreateInstance(workItem.TestClassType);
-                    }
-                    catch (Exception ex)
-                    {
-                        var failResult = new TestResult
-                        {
-                            FullName = workItem.FullName,
-                            Passed = false,
-                            ErrorMessage = "Failed to create test class instance: " + ex.Message
-                        };
-                        resultsBag.Add(failResult);
-                        return;
-                    }
-
-                    InjectSharedContext(instance!, workItem.TestClassType);
-
-                    var result = RunSingleTestWithTimeout(instance!, workItem.TestClassType, workItem.Method, workItem.FullName, workItem.TimeoutMilliseconds);
-                    resultsBag.Add(result);
-                });
-            
-            var orderedResults = resultsBag.OrderBy(r => r.FullName).ToList();
-            foreach (var result in orderedResults)
-            {
-                PrintTestResult(result);
-            }
-
-            return orderedResults;
+            return workItems;
         }
 
-        /// <summary>
-        /// Finds all fields and properties marked with [SharedContext], retrieves the corresponding
-        /// instances from TestContextContainer by type, and sets them on the test class instance.
-        /// </summary>
+        private static void OnPoolMonitoring(object? sender, PoolMonitorEventArgs e)
+        {
+            // Фильтруем события, чтобы не засорять консоль каждым стартом/завершением задачи
+            if (e.Kind == PoolMonitorKind.WorkerSpawned ||
+                e.Kind == PoolMonitorKind.WorkerCrashed ||
+                e.Kind == PoolMonitorKind.ShutdownCompleted ||
+                e.Kind == PoolMonitorKind.StuckWorkerSuspected)
+            {
+                lock (s_consoleLock)
+                {
+                    Console.ForegroundColor = ConsoleColor.Cyan;
+                    Console.WriteLine($"[POOL] {e.UtcTime:HH:mm:ss.fff} | {e.Kind} | Workers: {e.LiveWorkers} | {e.Message}");
+                    Console.ResetColor();
+                }
+            }
+        }
+
+        private static TestResult ExecuteTestItem(TestWorkItem workItem)
+        {
+            object? instance = null;
+            try
+            {
+                instance = Activator.CreateInstance(workItem.TestClassType);
+            }
+            catch (Exception ex)
+            {
+                return new TestResult
+                {
+                    FullName = workItem.FullName,
+                    Passed = false,
+                    ErrorMessage = "Failed to create test class instance: " + ex.Message
+                };
+            }
+
+            InjectSharedContext(instance!, workItem.TestClassType);
+
+            return RunSingleTestWithTimeout(instance!, workItem.TestClassType, workItem.Method, workItem.FullName, workItem.TimeoutMilliseconds, workItem.Arguments);
+        }
+
         private static void InjectSharedContext(object instance, Type testClassType)
         {
             var sharedContextAttr = typeof(SharedContextAttribute);
@@ -276,14 +318,14 @@ namespace myTestRunner
             }
         }
 
-        private static TestResult RunSingleTest(object instance, Type testClassType, MethodInfo method, string fullName)
+        private static TestResult RunSingleTest(object instance, Type testClassType, MethodInfo method, string fullName, object[]? arguments)
         {
             try
             {
                 InvokeLifecycleMethods(instance, testClassType, typeof(BeforeEachAttribute));
                 try
                 {
-                    object? returnValue = method.Invoke(instance, null);
+                    object? returnValue = method.Invoke(instance, arguments);
 
                     if (returnValue is Task task)
                         task.GetAwaiter().GetResult();
@@ -295,29 +337,33 @@ namespace myTestRunner
                     InvokeLifecycleMethods(instance, testClassType, typeof(AfterEachAttribute));
                 }
             }
+            catch (TargetInvocationException tie)
+            {
+                Exception ex = tie.InnerException ?? tie;
+                string message = ex.Message;
+                if (ex.StackTrace != null)
+                    message += Environment.NewLine + ex.StackTrace;
+                return new TestResult { FullName = fullName, Passed = false, ErrorMessage = message };
+            }
             catch (Exception ex)
             {
-                string message = ex.InnerException?.Message ?? ex.Message;
-                if (ex.InnerException?.StackTrace != null)
-                    message += Environment.NewLine + ex.InnerException.StackTrace;
+                string message = ex.Message;
+                if (ex.StackTrace != null)
+                    message += Environment.NewLine + ex.StackTrace;
                 return new TestResult { FullName = fullName, Passed = false, ErrorMessage = message };
             }
         }
 
-        /// <summary>
-        /// Wraps RunSingleTest with optional timeout, using TestClassAttribute.Timeout
-        /// from the test class or method. If timeoutMs &lt;= 0, test runs without timeout.
-        /// </summary>
-        private static TestResult RunSingleTestWithTimeout(object instance, Type testClassType, MethodInfo method, string fullName, int timeoutMs)
+        private static TestResult RunSingleTestWithTimeout(object instance, Type testClassType, MethodInfo method, string fullName, int timeoutMs, object[]? arguments)
         {
             if (timeoutMs <= 0)
             {
-                return RunSingleTest(instance, testClassType, method, fullName);
+                return RunSingleTest(instance, testClassType, method, fullName, arguments);
             }
 
             try
             {
-                var task = Task.Run(() => RunSingleTest(instance, testClassType, method, fullName));
+                var task = Task.Run(() => RunSingleTest(instance, testClassType, method, fullName, arguments));
                 bool completedInTime = task.Wait(timeoutMs);
                 if (!completedInTime)
                 {
@@ -333,9 +379,10 @@ namespace myTestRunner
             }
             catch (AggregateException ex)
             {
-                string message = ex.InnerException?.Message ?? ex.Message;
-                if (ex.InnerException?.StackTrace != null)
-                    message += Environment.NewLine + ex.InnerException.StackTrace;
+                Exception inner = ex.InnerException ?? ex;
+                string message = inner.Message;
+                if (inner.StackTrace != null)
+                    message += Environment.NewLine + inner.StackTrace;
                 return new TestResult { FullName = fullName, Passed = false, ErrorMessage = message };
             }
         }
@@ -392,18 +439,12 @@ namespace myTestRunner
             Console.WriteLine("======================================");
         }
 
-        /// <summary>
-        /// Writes a textual test protocol into MyTestRunner/TestResults.
-        /// Contains start time, duration, successful tests count, success percentage,
-        /// and error information for failed tests.
-        /// </summary>
         private static void WriteTestProtocol(List<TestResult> results, DateTime startTime, DateTime endTime)
         {
             try
             {
                 string baseDir = AppDomain.CurrentDomain.BaseDirectory;
 
-                // Locate 'myTestFramework/myTestRunner' project directory to place TestResults there.
                 DirectoryInfo? dir = new DirectoryInfo(baseDir);
                 while (dir != null && !dir.Name.Equals("myTestRunner", StringComparison.OrdinalIgnoreCase))
                 {

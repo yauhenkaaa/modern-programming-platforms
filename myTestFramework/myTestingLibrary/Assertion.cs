@@ -1,4 +1,5 @@
 ﻿using System.Collections.ObjectModel;
+using System.Linq.Expressions;
 
 namespace myTestingLibrary
 {
@@ -182,6 +183,48 @@ namespace myTestingLibrary
             if (actualString == null || !actualString.Contains(expectedSubstring))
             {
                 throw new Exceptions.AssertionException($"Expected string to contain '{expectedSubstring}', but it was '{actualString}'.");
+            }
+        }
+
+        /// <summary>
+        /// Проверяет истинность выражения. При сбое разбирает дерево выражений 
+        /// и выводит детальную информацию об операндах и операции.
+        /// </summary>
+        public static void That(Expression<Func<bool>> conditionExpr)
+        {
+            var compiled = conditionExpr.Compile();
+            if (!compiled())
+            {
+                string details = ParseExpression(conditionExpr.Body);
+                throw new Exceptions.AssertionException($"Expression failed: {conditionExpr.Body}\nDetails: {details}");
+            }
+        }
+
+        private static string ParseExpression(Expression expr)
+        {
+            if (expr is BinaryExpression binExpr)
+            {
+                object leftVal = GetValue(binExpr.Left);
+                object rightVal = GetValue(binExpr.Right);
+                string op = binExpr.NodeType.ToString();
+                return $"Left operand ({binExpr.Left}) = '{leftVal}', Operator = '{op}', Right operand ({binExpr.Right}) = '{rightVal}'";
+            }
+            return "Complex or non-binary expression.";
+        }
+
+        private static object GetValue(Expression expr)
+        {
+            try
+            {
+                // Оборачиваем выражение в конвертацию к object и компилируем для получения значения
+                var objectMember = Expression.Convert(expr, typeof(object));
+                var getterLambda = Expression.Lambda<Func<object>>(objectMember);
+                var getter = getterLambda.Compile();
+                return getter();
+            }
+            catch
+            {
+                return "Unknown/Un-evaluable";
             }
         }
     }

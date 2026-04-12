@@ -10,6 +10,7 @@
   <ItemGroup>
     <ProjectReference Include="..\myTestedProject\myTestedProject.csproj" />
     <ProjectReference Include="..\myTestingLibrary\myTestingLibrary.csproj" />
+    <ProjectReference Include="..\myThreadPool\myThreadPool.csproj" />
   </ItemGroup>
 
 </Project>

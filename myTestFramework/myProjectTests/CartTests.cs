@@ -129,6 +129,15 @@ namespace myProjectTests
             var foundProduct = _cart.Items.FirstOrDefault(p => p.Id == 1);
             Assertion.IsNull(foundProduct);
         }
+
+        [TestMethod]
+        public void TestExpressionTreeFailure()
+        {
+            int expectedItems = 5;
+            int actualItems = 2;
+            
+            Assertion.That(() => actualItems == expectedItems);
+        }
     }
 }
 
