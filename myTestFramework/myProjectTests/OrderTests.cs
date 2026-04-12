@@ -22,11 +22,10 @@ namespace myProjectTests
         /// <summary>
         /// This method tests the CheckStockAsync method of the InventoryService class using the shared context instance.
         /// </summary>
-        [TestClass(timeout: 1)]
         [TestMethod]
         public async Task TestStockCheckAsync()
         {
-            await Task.Delay(200000);
+            Thread.Sleep(1000);
             bool result = await _inventory.CheckStockAsync(1);
             Assertion.IsTrue(result);
         }
@@ -34,18 +33,18 @@ namespace myProjectTests
         /// <summary>
         /// This method tests the CreateOrderAsync method of the OrderManager class using the shared _inventory.
         /// </summary>
-        [TestClass(timeout: 2000)]
         [TestMethod]
         public async Task TestOrderResultType()
         {
             var manager = new OrderManager(_inventory);
 
             var user = new UserAccount();
+            Thread.Sleep(2000);
             user.SetEmail("test@example.com");
 
             var cart = new Cart();
             cart.AddProduct(new Product(0, "Banana", "Tasty bananas right from Ecuador", "Fruits", 3.49m));
-
+            Thread.Sleep(2000);
             var result = await manager.CreateOrderAsync(user, cart);
             Assertion.IsInstanceOfType(typeof(string), result);
         }

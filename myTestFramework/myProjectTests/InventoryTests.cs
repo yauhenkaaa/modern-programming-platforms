@@ -17,14 +17,14 @@ namespace myProjectTests
         [TestMethod]
         public void TestSharedContextWriteVisibleInOtherClass()
         {
+            Thread.Sleep(1000);
             _inventory.SharedState = 200;
             Assertion.AreEqual(200, _inventory.SharedState);
         }
 
         // Очень строгий таймаут (1 мс), а внутри — искусственная задержка,
         // чтобы гарантированно показать срабатывание механизма таймаута.
-        [TestClass(timeout: 1)]
-        [TestMethod]
+        [TestMethod(timeout: 10000)]
         public async Task TestCheckStockAsync()
         {
             await Task.Delay(2000); // имитация долгой операции

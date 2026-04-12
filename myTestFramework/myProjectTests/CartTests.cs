@@ -2,6 +2,7 @@
 using myTestingLibrary;
 using myTestingLibrary.Attributes;
 using System.Collections.ObjectModel;
+using System.Threading;
 
 namespace myProjectTests
 {
@@ -30,6 +31,7 @@ namespace myProjectTests
         [TestMethod]
         public void TestTotalSum()
         {
+            Thread.Sleep(1000);
             Product product = new Product(0, "Banana", "Tasty bananas right from Ecuador", "Fruits", 3.49m);
             _cart.AddProduct(product);
 
@@ -46,6 +48,7 @@ namespace myProjectTests
         [TestMethod]
         public void TestProductInequality()
         {
+            Thread.Sleep(1000);
             Product product1 = new Product(0, "Banana", "Tasty bananas right from Ecuador", "Fruits", 3.49m);
             Product product2 = new Product(1, "Apple", "Juicy Turkish apples", "Fruits", 7.49m);
 
@@ -61,6 +64,7 @@ namespace myProjectTests
         [TestMethod]
         public void TestRemoveSuccess()
         {
+            Thread.Sleep(1000);
             Product product = new Product(0, "Banana", "Tasty bananas right from Ecuador", "Fruits", 3.49m);
             _cart.AddProduct(product);
             bool result = _cart.RemoveProduct(0);
@@ -74,6 +78,7 @@ namespace myProjectTests
         [TestMethod]
         public void TestRemoveFailure()
         {
+            Thread.Sleep(1000);
             Product product = new Product(0, "Banana", "Tasty bananas right from Ecuador", "Fruits", 3.49m);
             _cart.AddProduct(product);
             bool result = _cart.RemoveProduct(1);
@@ -89,6 +94,7 @@ namespace myProjectTests
         [TestMethod]
         public void TestCartIsNotEmpty()
         {
+            Thread.Sleep(1000);
             Product product = new Product(0, "Banana", "Tasty bananas right from Ecuador", "Fruits", 3.49m);
             _cart.AddProduct(product);
             Collection<Product> items = new Collection<Product>(_cart.Items.ToList());
@@ -101,6 +107,7 @@ namespace myProjectTests
         [TestMethod]
         public void TestNegativePriceException()
         {
+            Thread.Sleep(1000);
             var badProduct = new Product(0, "Banana", "Tasty bananas right from Ecuador", "Fruits", -3.49m);
 
             Assertion.Throws<ArgumentException>(() =>
@@ -116,6 +123,7 @@ namespace myProjectTests
         [TestMethod]
         public void TestFindMissingProduct()
         {
+            Thread.Sleep(1000);
             Product product = new Product(0, "Banana", "Tasty bananas right from Ecuador", "Fruits", 3.49m);
             _cart.AddProduct(product);
             var foundProduct = _cart.Items.FirstOrDefault(p => p.Id == 1);

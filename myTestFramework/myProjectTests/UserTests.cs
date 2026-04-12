@@ -1,6 +1,7 @@
 ﻿using myTestedProject;
 using myTestingLibrary;
 using myTestingLibrary.Attributes;
+using System.Threading;
 
 namespace myProjectTests
 {
@@ -17,6 +18,7 @@ namespace myProjectTests
         {
             UserAccount user = new UserAccount();
             user.SetEmail("babayka123@gmail.com");
+            Thread.Sleep(2000);
             Assertion.IsNotNull(user);
         }
         /// <summary>
@@ -29,6 +31,7 @@ namespace myProjectTests
         {
             UserAccount user = new UserAccount();
             user.IsPremium = true;
+            Thread.Sleep(2000);
             string message = user.GetWelcomeMessage();
             Assertion.Contains("Premium", message);
         }
@@ -43,6 +46,7 @@ namespace myProjectTests
         public void TestInvalidEmail()
         {
             UserAccount user = new UserAccount();
+            Thread.Sleep(2000);
             Assertion.Throws<ArgumentException>(() => user.SetEmail("invalidemail"));
         }
 
@@ -57,6 +61,7 @@ namespace myProjectTests
         {
             UserAccount user = new UserAccount();
             user.IsPremium = false;
+            Thread.Sleep(2000);
             string message = user.GetWelcomeMessage();
             Assertion.Contains("Guest", message);
         }
@@ -69,6 +74,7 @@ namespace myProjectTests
         public void TestCouponExpiry()
         {   
             DiscountService service = new DiscountService();
+            Thread.Sleep(2000);
             Assertion.IsFalse(service.IsCouponExpired("NEW_YEAR_2025"));
         }
     }
